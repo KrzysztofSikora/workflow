@@ -5,7 +5,7 @@ stopping for a person**. Every decision the agent would otherwise ask about is m
 with its alternatives and its reversal cost, and put in front of the person **in the PR**.
 The person decides there, and one command applies those decisions.
 
-It is derived from the interactive workflow in `taskTreeCover/property-manager`
+It grew out of an interactive version of the same workflow
 (`/plan → /plan-review → /implement → /mutation → /review`), where each step waited for the
 user. The project-level steps stay interactive; the per-change loop no longer stops.
 

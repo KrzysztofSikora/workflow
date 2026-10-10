@@ -1,2 +1,5 @@
 __pycache__/
 .workflow/
+
+# Claude Code /export transcripts (may quote third-party material; keep out of the repo)
+/20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.txt
