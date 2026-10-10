@@ -1,0 +1,90 @@
+# Runs the autonomous change workflow in GitHub Actions.
+#
+#   - Label an issue `agent:ship` (the issue must be in the context/roadmap.md Issue column)
+#     -> .claude/workflow/ship '#<issue>' opens a PR.
+#   - Comment `/address` on that PR (after leaving review comments)
+#     -> .claude/workflow/address-pr <PR> applies them and replies.
+#   - Or start it by hand: Actions -> agent -> Run workflow.
+#
+# Secrets: ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`).
+# PRs pushed with the default GITHUB_TOKEN do not trigger other workflows (your CI). To get CI
+# on agent PRs, put a fine-grained PAT or GitHub App token in AGENT_GH_TOKEN.
+name: agent
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      item:
+        description: "Roadmap ID, change-id or #issue to ship"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: agent-${{ github.event.issue.number || inputs.item }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && github.event.label.name == 'agent:ship') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/address') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ secrets.AGENT_GH_TOKEN || github.token }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      # The runner VM is disposable; see .claude/workflow/config.sh for the trade-offs.
+      WORKFLOW_PERMISSION_MODE: auto
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.AGENT_GH_TOKEN || github.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      # TODO: install the project's own toolchain and dependencies here (the gates in CLAUDE.md
+      # must be runnable), e.g. pnpm install, docker compose up -d postgres.
+
+      - name: Configure git
+        run: |
+          git config user.name "workflow-agent"
+          git config user.email "workflow-agent@users.noreply.github.com"
+
+      - name: Ship
+        if: github.event_name != 'issue_comment'
+        env:
+          ITEM: ${{ inputs.item || format('#{0}', github.event.issue.number) }}
+        run: .claude/workflow/ship "$ITEM"
+
+      - name: Address PR comments
+        if: github.event_name == 'issue_comment'
+        env:
+          PR: ${{ github.event.issue.number }}
+        run: .claude/workflow/address-pr "$PR"
+
+      - name: Keep the run summary and session logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workflow-run-${{ github.run_id }}
+          path: .workflow/
+          include-hidden-files: true
+          if-no-files-found: ignore

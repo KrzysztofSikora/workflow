@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Act on the review comments of a pull request opened by `ship`, without stopping for a person.
+#
+#   .claude/workflow/address-pr <PR number> [--no-review]
+#
+# Reads every PR comment, review and inline comment newer than the last reply this script
+# posted, lets the agent apply the decisions (e.g. "D-3: take B", "R4: fix it"), re-runs
+# unfinished phases and a review round, refreshes the PR description and replies on the PR.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+# shellcheck source=lib.sh
+source .claude/workflow/lib.sh
+
+PR="" REVIEW=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-review) REVIEW=0; shift ;;
+    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+    *) [ -z "$PR" ] || die "unexpected argument: $1"; PR=${1#\#}; shift ;;
+  esac
+done
+[ -n "$PR" ] || die "usage: address-pr <PR number> [--no-review]"
+
+# ---------------------------------------------------------------------------- preflight
+
+command -v claude >/dev/null || die "claude CLI not found"
+command -v gh >/dev/null || die "gh CLI not found"
+git check-ignore -q .workflow/x || die ".workflow/ must be in .gitignore (run install.sh)"
+[ -z "$(git status --porcelain --untracked-files=no)" ] || die "tracked files have uncommitted changes; commit or stash first"
+
+HEAD_BRANCH=$(gh pr view "$PR" --json headRefName --jq .headRefName)
+BASE=$(gh pr view "$PR" --json baseRefName --jq .baseRefName)
+case "$HEAD_BRANCH" in change/*) ;; *) die "PR #$PR is not a change/<id> branch ($HEAD_BRANCH)" ;; esac
+CHANGE=${HEAD_BRANCH#change/}
+ISSUE=$($WF resolve "$CHANGE" | cut -f3)
+
+git fetch --quiet origin "$HEAD_BRANCH"
+if git rev-parse --verify --quiet "$HEAD_BRANCH" >/dev/null; then
+  git switch --quiet "$HEAD_BRANCH"
+  git merge --quiet --ff-only "origin/$HEAD_BRANCH" || die "local $HEAD_BRANCH has diverged from origin"
+else
+  git switch --quiet -c "$HEAD_BRANCH" "origin/$HEAD_BRANCH"
+fi
+
+DIR=.workflow/pr-$PR
+mkdir -p "$DIR"
+{
+  gh api "repos/{owner}/{repo}/issues/$PR/comments" --paginate \
+    --jq '.[] | {kind: "comment", id, author: .user.login, body, created_at, url: .html_url}'
+  gh api "repos/{owner}/{repo}/pulls/$PR/reviews" --paginate \
+    --jq '.[] | {kind: "review", id, author: .user.login, body, state, created_at: .submitted_at, url: .html_url}'
+  gh api "repos/{owner}/{repo}/pulls/$PR/comments" --paginate \
+    --jq '.[] | {kind: "inline", id, author: .user.login, body, path, line, in_reply_to_id, created_at, url: .html_url}'
+} > "$DIR/all.jsonl"
+COUNT=$($WF new-comments "$DIR/all.jsonl" "$DIR/comments.json")
+if [ "$COUNT" -eq 0 ]; then
+  echo "address-pr: no new comments on PR #$PR since the last reply"
+  exit 0
+fi
+
+begin_run "$CHANGE" "Run summary: address-pr #$PR ($CHANGE), $COUNT new comment(s)"
+rm -f "$DIR/replies.md"
+DRAFT_REASON=""
+
+pipeline() {
+  run_step address-pr "/address-pr $PR" "pr=$PR" || return 1
+  implement_loop || return 1
+  [ "$REVIEW" -eq 0 ] || review_loop 1
+}
+
+pipeline || note "pipeline stopped: $FAILED"
+save_leftovers
+write_pr_body
+publish_pr "$BASE"
+
+{
+  echo "<!-- workflow:address-pr -->"
+  if [ -f "$DIR/replies.md" ]; then cat "$DIR/replies.md"; else echo "The agent did not write replies."; fi
+  echo
+  echo "Run: ${FAILED:-completed}. The PR description was regenerated from the artifacts."
+} > "$DIR/reply-comment.md"
+gh pr comment "$PR" --body-file "$DIR/reply-comment.md" >/dev/null
+note "replied on PR #$PR"

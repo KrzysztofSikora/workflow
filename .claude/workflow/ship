@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Take one roadmap item from plan to pull request without stopping for a person.
+#
+#   .claude/workflow/ship <S-01 | change-id | #issue> [--base <branch>] [--no-mutation] [--no-pr]
+#
+# Every step is a fresh headless Claude Code session running one skill. Progress lives in the
+# artifacts (context/changes/<change-id>/), so re-running the same command resumes the item.
+# Decisions the agent made on its own are collected in the PR description for review.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+# shellcheck source=lib.sh
+source .claude/workflow/lib.sh
+
+ITEM="" BASE="" MUTATION=1 OPEN_PR=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base) BASE=$2; shift 2 ;;
+    --no-mutation) MUTATION=0; shift ;;
+    --no-pr) OPEN_PR=0; shift ;;
+    -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+    *) [ -z "$ITEM" ] || die "unexpected argument: $1"; ITEM=$1; shift ;;
+  esac
+done
+[ -n "$ITEM" ] || die "usage: ship <S-01 | change-id | #issue> [--base <branch>] [--no-mutation] [--no-pr]"
+
+# ---------------------------------------------------------------------------- preflight
+# Everything that could need a person is checked here, before any work starts.
+
+command -v claude >/dev/null || die "claude CLI not found"
+git check-ignore -q .workflow/x || die ".workflow/ must be in .gitignore (run install.sh)"
+[ -z "$(git status --porcelain --untracked-files=no)" ] || die "tracked files have uncommitted changes; commit or stash first"
+IFS=$'\t' read -r CHANGE ROADMAP_ID ISSUE < <($WF resolve "$ITEM")
+[ -n "$CHANGE" ] || die "roadmap item '$ITEM' has no change-id"
+
+if [ -z "$BASE" ]; then
+  BASE=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)
+  [ -n "$BASE" ] || BASE=$(git rev-parse --verify --quiet main >/dev/null && echo main || echo master)
+fi
+if git rev-parse --verify --quiet "change/$CHANGE" >/dev/null; then
+  git switch --quiet "change/$CHANGE"   # resume
+else
+  git switch --quiet -c "change/$CHANGE" "$BASE"
+fi
+
+begin_run "$CHANGE" "Run summary: ship $CHANGE ($ROADMAP_ID), base $BASE"
+DRAFT_REASON=""
+
+# ---------------------------------------------------------------------------- pipeline
+
+pipeline() {
+  local ticked total verdict round=0
+  read -r ticked total < <($WF progress "$CHANGE")
+  [ "$total" -gt 0 ] || run_step plan "/plan $CHANGE" || return 1
+
+  # Plan review: author and reviewer iterate; leftover blockers go to the PR instead of stopping.
+  # Skipped on resume once a reviewed plan is being implemented.
+  verdict=$($WF verdict "$CHANGE" plan-review)
+  if [ -z "$verdict" ] || { [ "$ticked" -eq 0 ] && [ "$verdict" = "NEEDS CHANGES" ]; }; then
+    while :; do
+      round=$((round + 1))
+      run_step plan-review "/plan-review $CHANGE" || return 1
+      verdict=$($WF verdict "$CHANGE" plan-review)
+      note "plan review round $round: $verdict"
+      [ "$verdict" = "NEEDS CHANGES" ] || break
+      if [ "$round" -ge "$WORKFLOW_PLAN_REVIEW_ROUNDS" ]; then
+        DRAFT_REASON="Plan review still says NEEDS CHANGES after $round rounds. Nothing was implemented; review the plan in this PR."
+        return 0
+      fi
+      run_step plan "/plan $CHANGE revise" || return 1
+    done
+  fi
+
+  implement_loop || return 1
+  if [ "$MUTATION" -eq 1 ] && [ ! -f "context/changes/$CHANGE/mutation.md" ]; then
+    run_step mutation "/mutation $CHANGE" || return 1
+  fi
+  review_loop "$WORKFLOW_REVIEW_ROUNDS"
+}
+
+pipeline || note "pipeline stopped: $FAILED"
+save_leftovers
+write_pr_body
+if [ "$OPEN_PR" -eq 1 ]; then
+  publish_pr "$BASE"
+else
+  note "--no-pr: description in context/changes/$CHANGE/pr-body.md"
+fi
